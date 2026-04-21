@@ -1,0 +1,9 @@
+# Ignore the data files
+*.tif
+*.gif
+*.jpg
+*.png
+
+# Ignore Python cache
+__pycache__/
+.ipynb_checkpoints/
