@@ -170,18 +170,9 @@ def build_log_kernels_batch(sigma_u_list, sigma_v, orientations, alpha=1.0, beta
 
 
 def multiscale_log_detector(image, mask, alpha=1.0, beta=0.5):
-    """
-    Apply the 2nd-order multi-dimensional LoG detector at multiple scales
-    and orientations.  Returns a uint8 image where vessels are BRIGHT.
-
-    Speed strategy:
-      • Build all kernels up-front
-      • Use scipy.ndimage.convolve with float32 (2× faster than float64)
-      • Keep a running max-response array — no list accumulation
-    """
     from scipy.ndimage import convolve as ndconvolve
 
-    # Paper parameters
+    # Paper parameters - DO NOT change these
     sigma_v_values     = [4, 5]
     elongation_factors = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
     n_orientations     = 12
@@ -189,54 +180,73 @@ def multiscale_log_detector(image, mask, alpha=1.0, beta=0.5):
 
     img_f32 = image.astype(np.float32) / 255.0
 
-    # Pre-fill border with retinal mean so convolution boundary artefacts
-    # don't bleed into the mask region
     retinal_mean = float(img_f32[mask > 0].mean())
     img_filled   = img_f32.copy()
     img_filled[mask == 0] = retinal_mean
 
-    max_response = np.zeros_like(img_filled)   # float32
+    max_response = np.zeros_like(img_filled)
 
     total_kernels = len(sigma_v_values) * len(elongation_factors) * n_orientations
     done = 0
 
     for sigma_v in sigma_v_values:
-        sigma_u_list = [sigma_v * f for f in elongation_factors]
-        kernels = build_log_kernels_batch(sigma_u_list, sigma_v, orientations, alpha, beta)
+        for f in elongation_factors:
+            sigma_u = sigma_v * f
+            if sigma_u < 0.5:
+                continue
 
-        for kernel in kernels:
-            k32 = kernel.astype(np.float32)
+            size = int(6 * max(sigma_u, sigma_v) + 1)
+            if size % 2 == 0:
+                size += 1
+            half = size // 2
+            y, x = np.mgrid[-half:half+1, -half:half+1]
 
-            # Convolve — 'reflect' mode avoids zero-padding artefacts
-            resp = ndconvolve(img_filled, k32, mode='reflect')
+            for theta in orientations:
+                cos_t, sin_t = np.cos(theta), np.sin(theta)
 
-            # For a dark vessel on a bright background the 2nd-order Gaussian
-            # derivative (kernel centre is negative) produces a POSITIVE response
-            # at the vessel ridge — so we keep the raw response directly.
-            # Only retain positive values (suppress noise / bright artefacts).
-            resp = np.maximum(resp, 0.0)
-            np.maximum(max_response, resp, out=max_response)
+                # PAPER Eq 13 convention: u = x*cos - y*sin, v = x*sin + y*cos
+                u = x * cos_t - y * sin_t
+                v = x * sin_t + y * cos_t
 
-            done += 1
-            if done % 20 == 0:
-                print(f"  LoG kernels done: {done}/{total_kernels}")
+                gauss  = np.exp(-(u**2 / (2*sigma_u**2) + v**2 / (2*sigma_v**2)))
+                kernel = ((u**2 - sigma_u**2) / (2 * np.pi * sigma_u**5 * sigma_v)) * gauss
 
-    # Zero out border
+                # Scale normalisation (Lindeberg) - alpha=1, beta=0.5 per paper
+                kernel *= (sigma_u ** alpha) * (sigma_v ** beta)
+                kernel -= kernel.mean()  # zero-mean
+
+                k32  = kernel.astype(np.float32)
+                resp = ndconvolve(img_filled, k32, mode='reflect')
+
+                # Dark vessels on bright background → positive response at vessel centre
+                resp = np.maximum(resp, 0.0)
+                np.maximum(max_response, resp, out=max_response)
+
+                done += 1
+                if done % 20 == 0:
+                    print(f"  LoG kernels done: {done}/{total_kernels}")
+
     max_response[mask == 0] = 0.0
 
-    # Percentile clip to suppress extreme outliers then normalise 0-255
     retinal_px = max_response[mask > 0]
-    p1, p99    = np.percentile(retinal_px, 1), np.percentile(retinal_px, 99)
-    retinal_px = np.clip(retinal_px, p1, p99)
+    print(f"LoG raw: mean={retinal_px.mean():.4f}  max={retinal_px.max():.4f}  "
+          f"pixels>0: {np.sum(retinal_px>0)}  "
+          f"pixels>p90: {np.sum(retinal_px > np.percentile(retinal_px,90))}")
 
-    result     = np.zeros_like(max_response)
-    rng        = retinal_px.max() - retinal_px.min()
+    # Use p99.5 clip instead of p99 - vessels are in the very top of the distribution
+    p0, p99 = np.percentile(retinal_px, 0), np.percentile(retinal_px, 99.5)
+    clipped  = np.clip(retinal_px, p0, p99)
+
+    result = np.zeros_like(max_response)
+    rng    = clipped.max() - clipped.min()
     if rng > 0:
-        result[mask > 0] = (retinal_px - retinal_px.min()) / rng * 255.0
+        result[mask > 0] = (clipped - clipped.min()) / rng * 255.0
 
     print(f"LoG result: mean={result[mask>0].mean():.1f}  "
           f"min={result[mask>0].min():.1f}  max={result[mask>0].max():.1f}")
     return result.astype(np.uint8)
+
+
 
 
 def compute_entropy(image):
@@ -292,19 +302,32 @@ def anisotropic_diffusion(image, mask, max_iter=50, kappa=15, gamma=0.1):
     return result.astype(np.uint8)
 
 
-def phase3_vessel_coherence(phase2_result, retinal_mask, alpha=1.0, beta=0.5):
+def phase3_vessel_coherence(phase2_intermediates, img_rgb, retinal_mask, alpha=1.0, beta=0.5):
     """
     Phase 3: Multi-scale LoG detection + Anisotropic Diffusion.
-    Input  : phase2_result  — uint8 grayscale, vessels are DARK on lighter background
-    Output : p3_result      — uint8 grayscale, vessels are BRIGHT on dark background
+    
+    PAPER FIX: The paper applies LoG to the GREEN CHANNEL of the Wiener-filtered
+    image directly (Section 3.5, Fig 5→6), not to the chained homomorphic+wiener output.
+    The Wiener is applied per RGB channel; green is selected for LoG.
     """
+    # Get the green channel from original image and apply Wiener directly to it
+    green_channel = img_rgb[:, :, 1]  # raw green channel
+    
+    # Apply Wiener filter directly to green channel (paper's pipeline: Wiener per channel → pick green)
+    green_wiener = wiener_filter(green_channel, retinal_mask, window_size=3)
+    
+    print(f"Green-Wiener input to LoG: mean={green_wiener[retinal_mask>0].mean():.1f}")
     print("Running multi-scale LoG detector...")
-    log_result = multiscale_log_detector(phase2_result, retinal_mask, alpha, beta)
+    log_result = multiscale_log_detector(green_wiener, retinal_mask, alpha, beta)
 
     print("Running anisotropic diffusion...")
     diffusion_result = anisotropic_diffusion(log_result, retinal_mask)
 
-    intermediates = {"log": log_result, "diffusion": diffusion_result}
+    intermediates = {
+        "green_wiener": green_wiener,
+        "log": log_result,
+        "diffusion": diffusion_result
+    }
     return diffusion_result, intermediates
 
 
@@ -497,7 +520,7 @@ if __name__ == "__main__":
 
     # ── Phase 3 ──────────────────────────────────────────────────────────────
     p3_result, p3_intermediates = phase3_vessel_coherence(
-        p2_result, retinal_mask, alpha=1.0, beta=0.5
+        p2_intermediates, img_rgb, retinal_mask, alpha=1.0, beta=0.5
     )
     visualize_phase3(p2_result, p3_intermediates)
     print(f"Phase3 mean (retinal): {p3_result[retinal_mask>0].mean():.2f}")
