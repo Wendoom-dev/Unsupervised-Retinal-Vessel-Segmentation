@@ -317,14 +317,169 @@ def visualize_phase3(phase2_result, intermediates):
     plt.suptitle("Phase 3: Vessel Coherence", fontsize=13)
     plt.tight_layout(); plt.show()
 
+#Phase 4AND5
+
+def morphological_reconstruction(marker, mask):
+    """
+    Morphological reconstruction by dilation. It will iteratively dilate the marker and mask until stability is reached.
+    """
+    kernel = np.ones((3, 3), np.uint8)
+    curr_marker = marker.copy()
+
+    while True:
+        expanded = cv2.dilate(curr_marker, kernel, iterations = 1)
+        expanded = cv2.bitwise_and(expanded, mask)
+
+        #Image change check
+        if np.array_equal(curr_marker, expanded):
+            break
+        curr_marker = expanded
+
+    return curr_marker
+
+def remove_small_objects(binary_image, min_size = 70):
+    """
+    As specified in the paper, remove connected components smaller than 70 pixels.
+    """
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_image, connectivity=8)
+    cleaned_image = np.zeros_like(binary_image)
+
+    for i in range(1, num_labels):
+        if stats [i, cv2.CC_STAT_AREA] >= min_size:
+            cleaned_image[labels == i] = 255
+
+    return cleaned_image
+
+def phase4_5_segmentation(phase3_result, retinal_mask):
+    """
+    Phase 4: Double Thresholding using histogram and edge-based means.
+    Phase 5: Morphological Reconstruction and small area removal.
+    """
+
+    retinal_pixels = phase3_result[retinal_mask > 0]
+
+    mean_val = np.mean(retinal_pixels)
+    std_val = np.std(retinal_pixels)
+
+    #Lower threshold
+    T_L = mean_val + (0.7 * std_val)
+
+    median_val = np.median(retinal_pixels)
+    lower_canny = int(max(0, 0.66 * median_val))
+    upper_canny = int(min(255, 1.33 * median_val))
+
+    #Upper threshold
+    edges = cv2.Canny(phase3_result, lower_canny, upper_canny)
+    edge_pixels = phase3_result[(edges > 0) & (retinal_mask > 0)]
+
+    if len(edge_pixels) > 0:
+        T_U = np.mean(edge_pixels)
+    else:
+        T_U = mean_val + (1.2 * std_val)
+
+    if T_L > T_U:
+        T_L, T_U = T_U, T_L
+
+    print(f"Thresholds -> T_L: {T_L:.2f}, T_U: {T_U:.2f}")
+
+    #Generate MASK and MARKER images
+    _, mask_img = cv2.threshold(phase3_result, T_L, 255, cv2.THRESH_BINARY)
+    _, marker_img = cv2.threshold(phase3_result, T_U, 255, cv2.THRESH_BINARY)
+
+    #Constrain to retinal region
+    mask_img = cv2.bitwise_and(mask_img, mask_img, mask=retinal_mask)
+    marker_img = cv2.bitwise_and(marker_img, marker_img, mask=retinal_mask)
+
+    print("Running morphological reconstruction...")
+    reconstructed_img = morphological_reconstruction(marker_img, mask_img)
+
+    print("Removing small noisy components...")
+    final_segmented = remove_small_objects(reconstructed_img, min_size=70)
+
+    intermediates = {
+        "mask_img" : mask_img,
+        "marker_img": marker_img,
+        "reconstructed": reconstructed_img,
+        "final": final_segmented
+    }
+
+    return final_segmented, intermediates
+
+def visualize_phase4_5(intermediates):
+    fig, axes = plt.subplots(2, 2, figsize=(12,12))
+    axes[0,0].imshow(intermediates["mask_img"], cmap = "gray"); axes[0,0].set_title("Mask Image (T_L)")
+    axes[0, 1].imshow(intermediates["marker_img"], cmap="gray"); axes[0, 1].set_title("Marker Image (T_U)")
+    axes[1, 0].imshow(intermediates["reconstructed"], cmap="gray"); axes[1, 0].set_title("Morphological Reconstruction")
+    axes[1, 1].imshow(intermediates["final"], cmap="gray"); axes[1, 1].set_title("Final Segmented (<70px removed)")
+
+    for ax in axes.flat:
+        ax.axis("off")
+
+    plt.suptitle("Phase 4 & 5: Binarization and Reconstruction", fontsize=15)
+    plt.tight_layout()
+    plt.show()
+
+#Evaluation
+
+def evaluate_segmentation(predicted_img, ground_truth_img, mask_img):
+    """
+    Calculates Sensitivity, Specificity, Accuracy, and AUC within the retinal field of view
+    from scratch, without using external machine learning libraries.
+    """
+    # 1. Convert images to strict binary arrays (0 and 1)
+    pred_bin = (predicted_img > 127).astype(np.uint8)
+    gt_bin = (ground_truth_img > 127).astype(np.uint8)
+    
+    # 2. Extract only the pixels inside the retina (ignoring the black corners)
+    roi = mask_img > 0
+    pred_roi = pred_bin[roi]
+    gt_roi = gt_bin[roi]
+    
+    # 3. Calculate Confusion Matrix components
+    # TP: Predicted is Vessel (1), Ground Truth is Vessel (1)
+    TP = np.sum((pred_roi == 1) & (gt_roi == 1))
+    
+    # TN: Predicted is Background (0), Ground Truth is Background (0)
+    TN = np.sum((pred_roi == 0) & (gt_roi == 0))
+    
+    # FP: Predicted is Vessel (1), Ground Truth is Background (0)
+    FP = np.sum((pred_roi == 1) & (gt_roi == 0))
+    
+    # FN: Predicted is Background (0), Ground Truth is Vessel (1)
+    FN = np.sum((pred_roi == 0) & (gt_roi == 1))
+    
+    # 4. Calculate Metrics
+    # Avoid division by zero
+    accuracy = (TP + TN) / (TP + TN + FP + FN) if (TP + TN + FP + FN) > 0 else 0
+    sensitivity = TP / (TP + FN) if (TP + FN) > 0 else 0
+    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+    
+    # The paper explicitly states: "The AUC is calculated using the formula AUC=(Se+Sp)/2"
+    auc = (sensitivity + specificity) / 2
+    
+    return {
+        "Accuracy (AC)": accuracy,
+        "Sensitivity (Se)": sensitivity,
+        "Specificity (Sp)": specificity,
+        "AUC": auc,
+        "TP": TP, "TN": TN, "FP": FP, "FN": FN
+    }
 
 # =============================================================================
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
     IMAGE_PATH = "test/21_training.tif"
+    GROUND_TRUTH_PATH = "test/21_manual1.gif"
 
     _, img_rgb = load_image(IMAGE_PATH)
+
+    try:
+        gt_img = np.array(Image.open(GROUND_TRUTH_PATH).convert('L'))
+    except FileNotFoundError:
+        print(f"Ground truth not found at {GROUND_TRUTH_PATH}. Evaluation will be skipped.")
+        gt_img = None
 
     # ── Phase 1 ──────────────────────────────────────────────────────────────
     p1_result, p1_intermediates = phase1_preprocessing(img_rgb, kernel_radius=7)
@@ -346,3 +501,26 @@ if __name__ == "__main__":
     )
     visualize_phase3(p2_result, p3_intermediates)
     print(f"Phase3 mean (retinal): {p3_result[retinal_mask>0].mean():.2f}")
+
+    # ── Phase 4 & 5 ──────────────────────────────────────────────────────────────
+    final_result, p4_intermediates = phase4_5_segmentation(p3_result, retinal_mask)
+    visualize_phase4_5(p4_intermediates)
+    print("Segmentation complete.")
+
+    # ── Phase 6: Evaluation ──────────────────────────────────────────────────
+    if gt_img is not None:
+        print("\n--- Evaluation Metrics ---")
+        metrics = evaluate_segmentation(final_result, gt_img, retinal_mask)
+        print(f"Accuracy (AC):    {metrics['Accuracy (AC)']:.4f}")
+        print(f"Sensitivity (Se): {metrics['Sensitivity (Se)']:.4f}")
+        print(f"Specificity (Sp): {metrics['Specificity (Sp)']:.4f}")
+        print(f"AUC:              {metrics['AUC']:.4f}")
+        
+        # Visualize Prediction vs Ground Truth
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        axes[0].imshow(final_result, cmap='gray'); axes[0].set_title("Predicted Vessels")
+        axes[1].imshow(gt_img, cmap='gray'); axes[1].set_title("Ground Truth (Manual)")
+        for ax in axes: ax.axis('off')
+        plt.suptitle("Final Output Comparison")
+        plt.tight_layout()
+        plt.show()
