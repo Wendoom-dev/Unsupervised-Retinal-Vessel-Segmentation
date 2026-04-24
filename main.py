@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 from scipy.signal import wiener
+from skimage.filters import frangi
 
 def load_image(image_path):
     """Load retinal fundus image and return BGR + RGB versions."""
@@ -256,7 +257,7 @@ def compute_entropy(image):
     return -np.sum(hist * np.log2(hist))
 
 
-def anisotropic_diffusion(image, mask, max_iter=50, kappa=15, gamma=0.1):
+def anisotropic_diffusion(image, mask, max_iter=15, kappa=5, gamma=0.1):
     """
     Perona-Malik anisotropic diffusion with entropy-based stopping criterion.
 
@@ -320,25 +321,48 @@ def phase3_vessel_coherence(phase2_intermediates, img_rgb, retinal_mask, alpha=1
     print("Running multi-scale LoG detector...")
     log_result = multiscale_log_detector(green_wiener, retinal_mask, alpha, beta)
 
+    #Addition of novelty via Hessian-based Frangi filter fusion
+    print("Running Frangi Vesselness filter...")
+    frangi_img = frangi(green_wiener, sigmas = range(1,4,1), black_ridges = True)
+
+    frangi_norm = np.zeros_like(frangi_img)
+    frangi_norm = cv2.normalize(frangi_img, frangi_norm, 0, 255, cv2.NORM_MINMAX)
+    frangi_norm = frangi_norm.astype(np.uint8)
+
+    fused_result = np.maximum(log_result, frangi_norm)
+
     print("Running anisotropic diffusion...")
-    diffusion_result = anisotropic_diffusion(log_result, retinal_mask)
+    diffusion_result = anisotropic_diffusion(fused_result, retinal_mask)
 
     intermediates = {
         "green_wiener": green_wiener,
+        "frangi": frangi_norm,
         "log": log_result,
+        "fused" : fused_result,
         "diffusion": diffusion_result
     }
     return diffusion_result, intermediates
 
 
 def visualize_phase3(phase2_result, intermediates):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].imshow(phase2_result,               cmap="gray"); axes[0].set_title("Phase 2 Output\n(dark vessels)")
-    axes[1].imshow(intermediates["log"],        cmap="gray"); axes[1].set_title("After Multi-scale LoG\n(vessels now BRIGHT)")
-    axes[2].imshow(intermediates["diffusion"],  cmap="gray"); axes[2].set_title("After Anisotropic Diffusion\n(gaps bridged)")
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    
+    axes[0].imshow(intermediates["log"], cmap="gray")
+    axes[0].set_title("1. Original LoG\n(Misses capillaries)")
+    
+    axes[1].imshow(intermediates["frangi"], cmap="gray")
+    axes[1].set_title("2. Frangi Filter\n(Finds tiny tubes)")
+    
+    axes[2].imshow(intermediates["fused"], cmap="gray")
+    axes[2].set_title("3. FUSED Features\n(Novelty!)")
+    
+    axes[3].imshow(intermediates["diffusion"], cmap="gray")
+    axes[3].set_title("4. After Diffusion")
+    
     for ax in axes: ax.axis("off")
-    plt.suptitle("Phase 3: Vessel Coherence", fontsize=13)
-    plt.tight_layout(); plt.show()
+    plt.suptitle("Phase 3: Hybrid Hessian-Laplacian Vessel Coherence", fontsize=15)
+    plt.tight_layout()
+    plt.show()
 
 #Phase 4AND5
 
@@ -380,7 +404,10 @@ def phase4_5_segmentation(phase3_result, retinal_mask):
     Phase 5: Morphological Reconstruction and small area removal.
     """
 
-    retinal_pixels = phase3_result[retinal_mask > 0]
+    erosion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    safe_mask = cv2.erode(retinal_mask, erosion_kernel, iterations=1)
+
+    retinal_pixels = phase3_result[safe_mask > 0]
 
     mean_val = np.mean(retinal_pixels)
     std_val = np.std(retinal_pixels)
@@ -394,7 +421,7 @@ def phase4_5_segmentation(phase3_result, retinal_mask):
 
     #Upper threshold
     edges = cv2.Canny(phase3_result, lower_canny, upper_canny)
-    edge_pixels = phase3_result[(edges > 0) & (retinal_mask > 0)]
+    edge_pixels = phase3_result[(edges > 0) & (safe_mask > 0)]
 
     if len(edge_pixels) > 0:
         T_U = np.mean(edge_pixels)
@@ -411,8 +438,8 @@ def phase4_5_segmentation(phase3_result, retinal_mask):
     _, marker_img = cv2.threshold(phase3_result, T_U, 255, cv2.THRESH_BINARY)
 
     #Constrain to retinal region
-    mask_img = cv2.bitwise_and(mask_img, mask_img, mask=retinal_mask)
-    marker_img = cv2.bitwise_and(marker_img, marker_img, mask=retinal_mask)
+    mask_img = cv2.bitwise_and(mask_img, mask_img, mask=safe_mask)
+    marker_img = cv2.bitwise_and(marker_img, marker_img, mask=safe_mask)
 
     print("Running morphological reconstruction...")
     reconstructed_img = morphological_reconstruction(marker_img, mask_img)
