@@ -6,31 +6,22 @@ from scipy.signal import wiener
 from skimage.filters import frangi
 
 def load_image(image_path):
-    """Load retinal fundus image and return BGR + RGB versions."""
     img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     return img_bgr, img_rgb
 
 def get_disk_kernel(radius):
-    """Create a circular (disk-shaped) structuring element."""
     size = 2 * radius + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
     return kernel
 
 def create_retinal_mask(image, threshold=10):
-    """
-    Creates a binary mask of the actual retinal region,
-    ignoring the black circular border in DRIVE images.
-    """
     _, mask = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY)
     kernel = get_disk_kernel(5)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     return mask
 
-# =============================================================================
-# PHASE 1
-# =============================================================================
 def phase1_preprocessing(img_rgb, kernel_radius=7):
     green = img_rgb[:, :, 1]
     retinal_mask = create_retinal_mask(green)
@@ -66,9 +57,6 @@ def visualize_phase1(img_rgb, intermediates):
     plt.suptitle("Phase 1: Pre-processing & Light Reflex Removal", fontsize=13)
     plt.tight_layout(); plt.show()
 
-# =============================================================================
-# PHASE 2
-# =============================================================================
 def homomorphic_filter(image, mask, sigma=30, gamma_low=0.5, gamma_high=2.0):
     img_float    = image.astype(np.float64)
     retinal_mean = img_float[mask > 0].mean()
@@ -132,17 +120,7 @@ def visualize_phase2(phase1_result, intermediates):
     plt.suptitle("Phase 2: Enhancement", fontsize=13)
     plt.tight_layout(); plt.show()
 
-# =============================================================================
-# PHASE 3  –  Multi-scale 2nd-order LoG  +  Anisotropic Diffusion
-# =============================================================================
-
 def build_log_kernels_batch(sigma_u_list, sigma_v, orientations, alpha=1.0, beta=0.5):
-    """
-    Pre-build all oriented 2nd-order Gaussian derivative kernels for one sigma_v.
-
-    Returns a list of (kernel, sigma_u, theta) tuples so we can loop efficiently.
-    Kernels are already scale-normalised and zero-meaned.
-    """
     kernels = []
     for sigma_u in sigma_u_list:
         if sigma_u < 0.5:
@@ -151,29 +129,23 @@ def build_log_kernels_batch(sigma_u_list, sigma_v, orientations, alpha=1.0, beta
         if size % 2 == 0:
             size += 1
         half = size // 2
-        y, x = np.mgrid[-half:half+1, -half:half+1]   # shape (size, size)
+        y, x = np.mgrid[-half:half+1, -half:half+1]
 
         for theta in orientations:
             cos_t, sin_t = np.cos(theta), np.sin(theta)
-            u =  x * cos_t + y * sin_t   # NOTE: paper convention
+            u =  x * cos_t + y * sin_t
             v = -x * sin_t + y * cos_t
 
             gauss  = np.exp(-(u**2 / (2*sigma_u**2) + v**2 / (2*sigma_v**2)))
             kernel = ((u**2 - sigma_u**2) / (2 * np.pi * sigma_u**5 * sigma_v)) * gauss
-
-            # Scale normalisation (Lindeberg)
             kernel *= (sigma_u ** alpha) * (sigma_v ** beta)
-
-            # Zero-mean  → no DC offset
             kernel -= kernel.mean()
             kernels.append(kernel)
     return kernels
 
-
 def multiscale_log_detector(image, mask, alpha=1.0, beta=0.5):
     from scipy.ndimage import convolve as ndconvolve
 
-    # Paper parameters - DO NOT change these
     sigma_v_values     = [4, 5]
     elongation_factors = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
     n_orientations     = 12
@@ -205,21 +177,18 @@ def multiscale_log_detector(image, mask, alpha=1.0, beta=0.5):
             for theta in orientations:
                 cos_t, sin_t = np.cos(theta), np.sin(theta)
 
-                # PAPER Eq 13 convention: u = x*cos - y*sin, v = x*sin + y*cos
                 u = x * cos_t - y * sin_t
                 v = x * sin_t + y * cos_t
 
                 gauss  = np.exp(-(u**2 / (2*sigma_u**2) + v**2 / (2*sigma_v**2)))
                 kernel = ((u**2 - sigma_u**2) / (2 * np.pi * sigma_u**5 * sigma_v)) * gauss
 
-                # Scale normalisation (Lindeberg) - alpha=1, beta=0.5 per paper
                 kernel *= (sigma_u ** alpha) * (sigma_v ** beta)
-                kernel -= kernel.mean()  # zero-mean
+                kernel -= kernel.mean()
 
                 k32  = kernel.astype(np.float32)
                 resp = ndconvolve(img_filled, k32, mode='reflect')
 
-                # Dark vessels on bright background → positive response at vessel centre
                 resp = np.maximum(resp, 0.0)
                 np.maximum(max_response, resp, out=max_response)
 
@@ -234,7 +203,6 @@ def multiscale_log_detector(image, mask, alpha=1.0, beta=0.5):
           f"pixels>0: {np.sum(retinal_px>0)}  "
           f"pixels>p90: {np.sum(retinal_px > np.percentile(retinal_px,90))}")
 
-    # Use p99.5 clip instead of p99 - vessels are in the very top of the distribution
     p0, p99 = np.percentile(retinal_px, 0), np.percentile(retinal_px, 99.5)
     clipped  = np.clip(retinal_px, p0, p99)
 
@@ -247,25 +215,12 @@ def multiscale_log_detector(image, mask, alpha=1.0, beta=0.5):
           f"min={result[mask>0].min():.1f}  max={result[mask>0].max():.1f}")
     return result.astype(np.uint8)
 
-
-
-
 def compute_entropy(image):
-    """Spatial entropy of image — used as stopping criterion."""
     hist, _ = np.histogram(image, bins=256, range=(0, 256), density=True)
     hist     = hist[hist > 0]
     return -np.sum(hist * np.log2(hist))
 
-
 def anisotropic_diffusion(image, mask, max_iter=15, kappa=5, gamma=0.1):
-    """
-    Perona-Malik anisotropic diffusion with entropy-based stopping criterion.
-
-    kappa  — edge sensitivity (lower = more edge preservation)
-              Paper uses dark vessels; LoG output has BRIGHT vessels, so we
-              want to smooth the background while keeping bright ridges → small κ
-    gamma  — step size (must be < 0.25 for stability)
-    """
     img = image.astype(np.float64)
     prev_entropy = compute_entropy(img)
 
@@ -302,26 +257,14 @@ def anisotropic_diffusion(image, mask, max_iter=15, kappa=5, gamma=0.1):
           f"min={result[mask>0].min():.1f}  max={result[mask>0].max():.1f}")
     return result.astype(np.uint8)
 
-
 def phase3_vessel_coherence(phase2_intermediates, img_rgb, retinal_mask, alpha=1.0, beta=0.5):
-    """
-    Phase 3: Multi-scale LoG detection + Anisotropic Diffusion.
-    
-    PAPER FIX: The paper applies LoG to the GREEN CHANNEL of the Wiener-filtered
-    image directly (Section 3.5, Fig 5→6), not to the chained homomorphic+wiener output.
-    The Wiener is applied per RGB channel; green is selected for LoG.
-    """
-    # Get the green channel from original image and apply Wiener directly to it
-    green_channel = img_rgb[:, :, 1]  # raw green channel
-    
-    # Apply Wiener filter directly to green channel (paper's pipeline: Wiener per channel → pick green)
+    green_channel = img_rgb[:, :, 1]
     green_wiener = wiener_filter(green_channel, retinal_mask, window_size=3)
     
     print(f"Green-Wiener input to LoG: mean={green_wiener[retinal_mask>0].mean():.1f}")
     print("Running multi-scale LoG detector...")
     log_result = multiscale_log_detector(green_wiener, retinal_mask, alpha, beta)
 
-    #Addition of novelty via Hessian-based Frangi filter fusion
     print("Running Frangi Vesselness filter...")
     frangi_img = frangi(green_wiener, sigmas = range(1,4,1), black_ridges = True)
 
@@ -343,7 +286,6 @@ def phase3_vessel_coherence(phase2_intermediates, img_rgb, retinal_mask, alpha=1
     }
     return diffusion_result, intermediates
 
-
 def visualize_phase3(phase2_result, intermediates):
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
     
@@ -364,12 +306,7 @@ def visualize_phase3(phase2_result, intermediates):
     plt.tight_layout()
     plt.show()
 
-#Phase 4AND5
-
 def morphological_reconstruction(marker, mask):
-    """
-    Morphological reconstruction by dilation. It will iteratively dilate the marker and mask until stability is reached.
-    """
     kernel = np.ones((3, 3), np.uint8)
     curr_marker = marker.copy()
 
@@ -377,7 +314,6 @@ def morphological_reconstruction(marker, mask):
         expanded = cv2.dilate(curr_marker, kernel, iterations = 1)
         expanded = cv2.bitwise_and(expanded, mask)
 
-        #Image change check
         if np.array_equal(curr_marker, expanded):
             break
         curr_marker = expanded
@@ -385,10 +321,6 @@ def morphological_reconstruction(marker, mask):
     return curr_marker
 
 def remove_small_objects(binary_image, min_size = 70):
-    """
-    As specified in the paper, remove connected components smaller than 70 pixels.
-    """
-
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_image, connectivity=8)
     cleaned_image = np.zeros_like(binary_image)
 
@@ -399,11 +331,6 @@ def remove_small_objects(binary_image, min_size = 70):
     return cleaned_image
 
 def phase4_5_segmentation(phase3_result, retinal_mask):
-    """
-    Phase 4: Double Thresholding using histogram and edge-based means.
-    Phase 5: Morphological Reconstruction and small area removal.
-    """
-
     erosion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     safe_mask = cv2.erode(retinal_mask, erosion_kernel, iterations=1)
 
@@ -412,14 +339,12 @@ def phase4_5_segmentation(phase3_result, retinal_mask):
     mean_val = np.mean(retinal_pixels)
     std_val = np.std(retinal_pixels)
 
-    #Lower threshold
     T_L = mean_val + (0.7 * std_val)
 
     median_val = np.median(retinal_pixels)
     lower_canny = int(max(0, 0.66 * median_val))
     upper_canny = int(min(255, 1.33 * median_val))
 
-    #Upper threshold
     edges = cv2.Canny(phase3_result, lower_canny, upper_canny)
     edge_pixels = phase3_result[(edges > 0) & (safe_mask > 0)]
 
@@ -433,11 +358,9 @@ def phase4_5_segmentation(phase3_result, retinal_mask):
 
     print(f"Thresholds -> T_L: {T_L:.2f}, T_U: {T_U:.2f}")
 
-    #Generate MASK and MARKER images
     _, mask_img = cv2.threshold(phase3_result, T_L, 255, cv2.THRESH_BINARY)
     _, marker_img = cv2.threshold(phase3_result, T_U, 255, cv2.THRESH_BINARY)
 
-    #Constrain to retinal region
     mask_img = cv2.bitwise_and(mask_img, mask_img, mask=safe_mask)
     marker_img = cv2.bitwise_and(marker_img, marker_img, mask=safe_mask)
 
@@ -470,42 +393,23 @@ def visualize_phase4_5(intermediates):
     plt.tight_layout()
     plt.show()
 
-#Evaluation
-
 def evaluate_segmentation(predicted_img, ground_truth_img, mask_img):
-    """
-    Calculates Sensitivity, Specificity, Accuracy, and AUC within the retinal field of view
-    from scratch, without using external machine learning libraries.
-    """
-    # 1. Convert images to strict binary arrays (0 and 1)
     pred_bin = (predicted_img > 127).astype(np.uint8)
     gt_bin = (ground_truth_img > 127).astype(np.uint8)
     
-    # 2. Extract only the pixels inside the retina (ignoring the black corners)
     roi = mask_img > 0
     pred_roi = pred_bin[roi]
     gt_roi = gt_bin[roi]
     
-    # 3. Calculate Confusion Matrix components
-    # TP: Predicted is Vessel (1), Ground Truth is Vessel (1)
     TP = np.sum((pred_roi == 1) & (gt_roi == 1))
-    
-    # TN: Predicted is Background (0), Ground Truth is Background (0)
     TN = np.sum((pred_roi == 0) & (gt_roi == 0))
-    
-    # FP: Predicted is Vessel (1), Ground Truth is Background (0)
     FP = np.sum((pred_roi == 1) & (gt_roi == 0))
-    
-    # FN: Predicted is Background (0), Ground Truth is Vessel (1)
     FN = np.sum((pred_roi == 0) & (gt_roi == 1))
     
-    # 4. Calculate Metrics
-    # Avoid division by zero
     accuracy = (TP + TN) / (TP + TN + FP + FN) if (TP + TN + FP + FN) > 0 else 0
     sensitivity = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
     
-    # The paper explicitly states: "The AUC is calculated using the formula AUC=(Se+Sp)/2"
     auc = (sensitivity + specificity) / 2
     
     return {
@@ -516,9 +420,6 @@ def evaluate_segmentation(predicted_img, ground_truth_img, mask_img):
         "TP": TP, "TN": TN, "FP": FP, "FN": FN
     }
 
-# =============================================================================
-# MAIN
-# =============================================================================
 if __name__ == "__main__":
     IMAGE_PATH = "test/21_training.tif"
     GROUND_TRUTH_PATH = "test/21_manual1.gif"
@@ -531,13 +432,11 @@ if __name__ == "__main__":
         print(f"Ground truth not found at {GROUND_TRUTH_PATH}. Evaluation will be skipped.")
         gt_img = None
 
-    # ── Phase 1 ──────────────────────────────────────────────────────────────
     p1_result, p1_intermediates = phase1_preprocessing(img_rgb, kernel_radius=7)
     visualize_phase1(img_rgb, p1_intermediates)
     retinal_mask = p1_intermediates["mask"]
     print(f"Phase1 mean (retinal): {p1_result[retinal_mask>0].mean():.2f}")
 
-    # ── Phase 2 ──────────────────────────────────────────────────────────────
     p2_result, p2_intermediates = phase2_enhancement(
         p1_result, retinal_mask,
         sigma=15, gamma_low=0.3, gamma_high=2.5, wiener_window=3
@@ -545,19 +444,16 @@ if __name__ == "__main__":
     visualize_phase2(p1_result, p2_intermediates)
     print(f"Phase2 mean (retinal): {p2_result[retinal_mask>0].mean():.2f}")
 
-    # ── Phase 3 ──────────────────────────────────────────────────────────────
     p3_result, p3_intermediates = phase3_vessel_coherence(
         p2_intermediates, img_rgb, retinal_mask, alpha=1.0, beta=0.5
     )
     visualize_phase3(p2_result, p3_intermediates)
     print(f"Phase3 mean (retinal): {p3_result[retinal_mask>0].mean():.2f}")
 
-    # ── Phase 4 & 5 ──────────────────────────────────────────────────────────────
     final_result, p4_intermediates = phase4_5_segmentation(p3_result, retinal_mask)
     visualize_phase4_5(p4_intermediates)
     print("Segmentation complete.")
 
-    # ── Phase 6: Evaluation ──────────────────────────────────────────────────
     if gt_img is not None:
         print("\n--- Evaluation Metrics ---")
         metrics = evaluate_segmentation(final_result, gt_img, retinal_mask)
@@ -566,7 +462,6 @@ if __name__ == "__main__":
         print(f"Specificity (Sp): {metrics['Specificity (Sp)']:.4f}")
         print(f"AUC:              {metrics['AUC']:.4f}")
         
-        # Visualize Prediction vs Ground Truth
         fig, axes = plt.subplots(1, 2, figsize=(12, 6))
         axes[0].imshow(final_result, cmap='gray'); axes[0].set_title("Predicted Vessels")
         axes[1].imshow(gt_img, cmap='gray'); axes[1].set_title("Ground Truth (Manual)")
